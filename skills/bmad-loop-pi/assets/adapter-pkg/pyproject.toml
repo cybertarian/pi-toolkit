@@ -1,0 +1,22 @@
+[project]
+name = "bmad-loop-adapter-pi"
+version = "0.1.0"
+description = "bmad-loop adapter driving the pi coding agent (earendil-works/pi-coding-agent) in print mode"
+requires-python = ">=3.11"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bmad_loop_adapter_pi"]
+
+# The co-installed package registers its adapter kind with bmad-loop's live
+# registry (the `bmad_loop.adapters` entry-point group, scanned by
+# `bmad_loop.adapters.registry._load_external_adapters`). bmad-loop itself is
+# co-installed into the same environment (`uv tool install bmad-loop --with <this package>`)
+# and deliberately NOT declared a dependency: the package is a plugin, and a
+# broken import must only skip this adapter, never break bmad-loop.
+[project.entry-points."bmad_loop.adapters"]
+pi = "bmad_loop_adapter_pi"

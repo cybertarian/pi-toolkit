@@ -1,0 +1,56 @@
+# bmad-loop profile: drive the pi coding agent (pi-coding-agent, earendil-works)
+# in print mode. REFERENCE template, verified on bmad-loop 0.13.2 + pi 1.2.0
+# (2026-12). Forward-tolerant: unknown top-level keys are ignored by
+# forward-tolerant: unknown top-level keys are ignored, so patch in place
+# only when NEW required fields appear (see the skill's
+# references/seam-drift-audit.md, seam 5).
+# Select with:
+#   bmad-loop init --cli pi
+# and in .bmad-loop/policy.toml:
+#   [adapter]
+#   name = "pi"
+#
+# Requires the co-installed adapter package `bmad-loop-adapter-pi`
+# (uv tool install bmad-loop --with <path or package>). The kind it
+# registers is `pi` (needs_mux = False: one pi process per session, no
+# terminal multiplexer).
+
+name = "pi"
+binary = "pi"
+adapter = "pi"
+
+# pi scans .agents/skills/ (Agent Skills standard) - where BMAD's installer
+# and `bmad-loop init` lay the bmad-* skills on this project.
+skill_tree = ".agents/skills"
+
+# pi's interactive `/skill:name` forced-invocation. Print mode sends the
+# prompt to the model as a message; the skills are already advertised in pi's
+# system prompt, so naming the skill in the prompt is what routes it.
+prompt_template = "Invoke the pi skill /skill:{skill} now and complete it end-to-end without stopping. Arguments: {args}"
+
+# Unattended trust: pi cannot answer its first-run workspace-trust dialog
+# from a spawned process, so the profile passes --approve per run (covers
+# main checkout and fresh worktree isolation dirs alike).
+bypass_args = ["--approve"]
+model_flag = "--model"
+
+# No usage parser in bmad_loop/tokens.py: the adapter package reads pi's
+# session-file usage itself (assistant-message usage + usage entries +
+# compaction/branch-summary usage).
+usage_parser = "none"
+
+first_run_note = """\
+pi must be on PATH (on Windows the launcher is pi.cmd; a POSIX `pi` shell
+script is skipped) and authenticated for its default provider (check with
+`pi auth`). `--approve` is passed per run, so no interactive trust dialog
+can block spawned sessions. pi 1.2.0 verified 2026-12."""
+
+# pi has no lifecycle-hook settings file that bmad-loop can write (its
+# extension system is JS modules, not declarative settings), so completion
+# is observed by process exit + the on-disk session file. Consequences:
+# no stall wake-nudges (a result-less turn end degrades to stalled and the
+# run pauses per policy), and the TUI shows logs instead of a live pane.
+[hooks]
+dialect = "none"
+config_path = ""
+events = {}

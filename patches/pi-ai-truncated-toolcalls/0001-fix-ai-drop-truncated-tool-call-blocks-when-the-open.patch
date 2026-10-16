@@ -1,0 +1,334 @@
+From a0cd10f8d8aa17f52361c235b970c5fa97817eaa Mon Sep 17 00:00:00 2001
+From: WynnHu <nameless.hu@gmail.com>
+Date: Sat, 3 Oct 2026 20:42:59 +0100
+Subject: [PATCH 1/2] fix(ai): drop truncated tool-call blocks when the
+ openai-completions stream dies
+
+---
+ packages/ai/src/api/openai-completions.ts     |  36 ++-
+ ...ai-completions-truncated-toolcalls.test.ts | 225 ++++++++++++++++++
+ 2 files changed, 259 insertions(+), 2 deletions(-)
+ create mode 100644 packages/ai/test/openai-completions-truncated-toolcalls.test.ts
+
+diff --git a/packages/ai/src/api/openai-completions.ts b/packages/ai/src/api/openai-completions.ts
+index e4ebb7c..986ce02 100644
+--- a/packages/ai/src/api/openai-completions.ts
++++ b/packages/ai/src/api/openai-completions.ts
+@@ -39,7 +39,7 @@ import { formatProviderError, normalizeProviderError } from "../utils/error-body
+ import { AssistantMessageEventStream } from "../utils/event-stream.ts";
+ import { shortHash } from "../utils/hash.ts";
+ import { headersToRecord } from "../utils/headers.ts";
+-import { parseStreamingJson } from "../utils/json-parse.ts";
++import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse.ts";
+ import { getPiUserAgent } from "../utils/pi-user-agent.ts";
+ import { getProviderEnvValue } from "../utils/provider-env.ts";
+ import { retryProviderRequest } from "../utils/provider-retry.ts";
+@@ -380,6 +380,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
+ 
+ 			interface StreamingToolCallBlock extends ToolCall {
+ 				partialArgs?: string;
++				argsComplete?: boolean;
+ 				customInput?: {
+ 					property: string;
+ 					jsonBuffer: GrammarToolInputJsonBuffer;
+@@ -459,7 +460,9 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
+ 						block.arguments = parseStreamingJson(block.partialArgs);
+ 					}
+ 					// Finalize in-place and strip the scratch buffers so replay only
+-					// carries parsed arguments.
++					// carries parsed arguments. argsComplete survives finishBlock on
++					// purpose: the error path below needs it to tell which tool calls
++					// streamed complete JSON before the stream died.
+ 					delete block.partialArgs;
+ 					delete block.customInput;
+ 					delete block.streamIndex;
+@@ -649,9 +652,20 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
+ 								delta = toolCall.function.arguments;
+ 								block.partialArgs = (block.partialArgs ?? "") + toolCall.function.arguments;
+ 								block.arguments = parseStreamingJson(block.partialArgs);
++								// Track whether the accumulated raw arguments are fully closed
++								// JSON. A truncated stream must not persist tool calls whose
++								// arguments never completed (they would surface as empty-argument
++								// calls in session logs).
++								try {
++									parseJsonWithRepair(block.partialArgs);
++									block.argsComplete = true;
++								} catch {
++									block.argsComplete = false;
++								}
+ 							} else if (toolCall.custom?.input) {
+ 								const nextInput = getCustomToolCallInput(block) + toolCall.custom.input;
+ 								delta = appendCustomToolCallInput(block, nextInput, false) ?? "";
++								block.argsComplete = block.customInput?.jsonBuffer.closed === true;
+ 							}
+ 							stream.push({
+ 								type: "toolcall_delta",
+@@ -697,9 +711,26 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
+ 				throw new Error("Stream ended without finish_reason");
+ 			}
+ 
++			// Scratch fields must not leak into the persisted message.
++			for (const block of blocks) {
++				if (block.type === "toolCall") {
++					delete block.argsComplete;
++				}
++			}
+ 			stream.push({ type: "done", reason: output.stopReason, message: output });
+ 			stream.end();
+ 		} catch (error) {
++			// A truncated stream can leave tool-call blocks whose arguments never
++			// finished. Those blocks cannot be executed and would persist into
++			// session logs as bogus empty-argument calls, so drop every tool call
++			// that never received fully-parsed arguments. Text and thinking blocks
++			// are kept so the error context stays readable.
++			for (let index = output.content.length - 1; index >= 0; index -= 1) {
++				const block = output.content[index];
++				if (block && block.type === "toolCall" && !(block as { argsComplete?: boolean }).argsComplete) {
++					output.content.splice(index, 1);
++				}
++			}
+ 			for (const block of output.content) {
+ 				if (block.type === "thinking") {
+ 					applyStreamedReasoningDetails(block);
+@@ -707,6 +738,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
+ 				delete (block as { index?: number }).index;
+ 				// Streaming scratch buffers are only used during parsing; never persist them.
+ 				delete (block as { partialArgs?: string }).partialArgs;
++				delete (block as { argsComplete?: boolean }).argsComplete;
+ 				delete (block as { customInput?: unknown }).customInput;
+ 				delete (block as { streamIndex?: number }).streamIndex;
+ 			}
+diff --git a/packages/ai/test/openai-completions-truncated-toolcalls.test.ts b/packages/ai/test/openai-completions-truncated-toolcalls.test.ts
+new file mode 100644
+index 0000000..34f4e43
+--- /dev/null
++++ b/packages/ai/test/openai-completions-truncated-toolcalls.test.ts
+@@ -0,0 +1,225 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import { stream as streamOpenAICompletions } from "../src/api/openai-completions.ts";
++import type { Model } from "../src/types.ts";
++import { normalizeContext } from "../src/utils/transcript.ts";
++
++type ToolCallsDelta = Array<{
++	index: number;
++	id?: string;
++	type?: string;
++	function?: { name?: string; arguments?: string };
++}>;
++
++type Chunk = {
++	id: string;
++	choices: Array<{
++		index: number;
++		delta: { tool_calls?: ToolCallsDelta };
++		finish_reason?: string | null;
++	}>;
++};
++
++const mockState = vi.hoisted(() => ({
++	chunks: [] as Chunk[],
++}));
++
++vi.mock("openai", () => {
++	class FakeOpenAI {
++		chat = {
++			completions: {
++				create: (_params: unknown, _options: unknown) => {
++					const chunks = mockState.chunks;
++					const stream = {
++						async *[Symbol.asyncIterator]() {
++							for (const chunk of chunks) {
++								yield chunk;
++							}
++						},
++					};
++					const promise = Promise.resolve(stream) as Promise<typeof stream> & {
++						withResponse: () => Promise<{
++							data: typeof stream;
++							response: { status: number; headers: Headers };
++						}>;
++					};
++					promise.withResponse = async () => ({
++						data: stream,
++						response: { status: 200, headers: new Headers() },
++					});
++					return promise;
++				},
++			},
++		};
++	}
++	return { default: FakeOpenAI };
++});
++
++const model: Model<"openai-completions"> = {
++	id: "test-model",
++	name: "Test Model",
++	api: "openai-completions",
++	provider: "openai",
++	baseUrl: "https://api.openai.com/v1",
++	reasoning: false,
++	input: ["text"],
++	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
++	contextWindow: 1000,
++	maxTokens: 100,
++};
++
++const context = normalizeContext({
++	systemPrompt: "",
++	messages: [{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: 0 }],
++	tools: [],
++});
++
++async function consume() {
++	const stream = streamOpenAICompletions(model, context, { apiKey: "test" });
++	for await (const _event of stream) {
++		void _event;
++	}
++	return stream.result();
++}
++
++function toolCalls(message: Awaited<ReturnType<typeof consume>>) {
++	return message.content.filter((block) => block.type === "toolCall");
++}
++
++describe("openai-completions truncated stream tool-call handling", () => {
++	beforeEach(() => {
++		mockState.chunks = [];
++	});
++
++	it("drops a tool call that received no argument deltas before the stream ended without finish_reason", async () => {
++		// Provider drops the connection right after the tool call starts:
++		// the block exists but its arguments never stream (partialArgs stays empty).
++		mockState.chunks = [
++			{
++				id: "chatcmpl-test",
++				choices: [
++					{
++						index: 0,
++						delta: {
++							tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "write" } }],
++						},
++					},
++				],
++			},
++		];
++
++		const result = await consume();
++
++		expect(result.stopReason).toBe("error");
++		expect(result.errorMessage).toContain("Stream ended without finish_reason");
++		expect(toolCalls(result)).toHaveLength(0);
++	});
++
++	it("drops a tool call with partially streamed arguments when the stream ends without finish_reason", async () => {
++		mockState.chunks = [
++			{
++				id: "chatcmpl-test",
++				choices: [
++					{
++						index: 0,
++						delta: {
++							tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "write" } }],
++						},
++					},
++				],
++			},
++			{
++				id: "chatcmpl-test",
++				choices: [
++					{
++						index: 0,
++						delta: {
++							tool_calls: [{ index: 0, function: { arguments: '{"path":"a.md",' } }],
++						},
++					},
++				],
++			},
++		];
++
++		const result = await consume();
++
++		expect(result.stopReason).toBe("error");
++		expect(result.errorMessage).toContain("Stream ended without finish_reason");
++		// The half-streamed arguments must not persist as a bogus tool call.
++		expect(toolCalls(result)).toHaveLength(0);
++	});
++
++	it("keeps a tool call whose arguments fully streamed as valid JSON even if finish_reason never arrived", async () => {
++		mockState.chunks = [
++			{
++				id: "chatcmpl-test",
++				choices: [
++					{
++						index: 0,
++						delta: {
++							tool_calls: [
++								{
++									index: 0,
++									id: "call_1",
++									type: "function",
++									function: { name: "write", arguments: '{"path":"a.md"}' },
++								},
++							],
++						},
++					},
++				],
++			},
++		];
++
++		const result = await consume();
++
++		expect(result.stopReason).toBe("error");
++		const calls = toolCalls(result);
++		expect(calls).toHaveLength(1);
++		const call = calls[0];
++		if (!call || call.type !== "toolCall") throw new Error("Expected one toolCall");
++		expect(call.name).toBe("write");
++		expect(call.arguments).toEqual({ path: "a.md" });
++		// No streaming scratch fields may leak into the persisted message.
++		expect("partialArgs" in call).toBe(false);
++		expect("argsComplete" in call).toBe(false);
++		expect("customInput" in call).toBe(false);
++	});
++
++	it("keeps completed tool calls and strips scratch fields on the normal finish_reason path", async () => {
++		mockState.chunks = [
++			{
++				id: "chatcmpl-test",
++				choices: [
++					{
++						index: 0,
++						delta: {
++							tool_calls: [
++								{
++									index: 0,
++									id: "call_1",
++									type: "function",
++									function: { name: "write", arguments: '{"path":"a.md"}' },
++								},
++							],
++						},
++					},
++				],
++			},
++			{
++				id: "chatcmpl-test",
++				choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
++			},
++		];
++
++		const result = await consume();
++
++		expect(result.stopReason).toBe("toolUse");
++		const calls = toolCalls(result);
++		expect(calls).toHaveLength(1);
++		const call = calls[0];
++		if (!call || call.type !== "toolCall") throw new Error("Expected one toolCall");
++		expect(call.arguments).toEqual({ path: "a.md" });
++		expect("partialArgs" in call).toBe(false);
++		expect("argsComplete" in call).toBe(false);
++	});
++});
+-- 
+2.54.0.windows.1
+

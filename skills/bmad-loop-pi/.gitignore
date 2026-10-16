@@ -1,0 +1,8 @@
+# build/run artifacts — the skill ships source only
+__pycache__/
+*.pyc
+*.pyd
+
+# smoke-test working dir (created under <project>/tmp at run time, but
+# guard against a stray local run)
+/bmad-loop-pi-smoke/
