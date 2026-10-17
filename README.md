@@ -44,6 +44,7 @@ In-process TypeScript loaded from `~/.pi/agent/extensions/`.
 | Component | Use it for | Install |
 | --- | --- | --- |
 | [`pi-toolcall-integrity`](./extensions/pi-toolcall-integrity) | Drop the fake empty-argument tool calls pi persists when a provider stream dies mid tool-call, and fail fast with a readable "re-issue" message instead of a cryptic schema error when one slips through. | copy `pi-toolcall-integrity.ts` to `~/.pi/agent/extensions/` |
+| [`pi-agnes-multikey-bridge`](./extensions/pi-agnes-multikey-bridge) | Spread pi-agnes-tools' image/video generation across a pi-multikey pool: round-robins the env key per call + transparently retries 401/403/429 on the next pool key — pi-agnes-tools untouched. | copy `pi-agnes-multikey-bridge.ts` to `~/.pi/agent/extensions/` |
 
 ### Skills
 

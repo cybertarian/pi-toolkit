@@ -1,0 +1,34 @@
+{
+  "pools": [
+    {
+      "id": "agnes-pool",
+      "name": "agnes-pool (fixture)",
+      "baseUrl": "https://apihub.agnes-ai.com/v1",
+      "api": "openai-completions",
+      "keys": [
+        { "key": "sk-test-key-1", "label": "key-1", "enabled": true },
+        { "key": "sk-test-key-2", "label": "key-2", "enabled": true },
+        { "key": "sk-test-key-3", "label": "key-3", "enabled": true },
+        { "key": "sk-test-key-4", "label": "key-4", "enabled": true },
+        { "key": "sk-test-key-disabled", "label": "disabled", "enabled": false }
+      ]
+    },
+    {
+      "id": "other-pool",
+      "baseUrl": "https://api.unrelated.example.com/v1",
+      "api": "openai-completions",
+      "keys": [
+        { "key": "sk-other-key-1", "label": "other", "enabled": true }
+      ]
+    },
+    {
+      "id": "agnes-cn-pool",
+      "baseUrl": "https://api.agnes-ai.cn/v1",
+      "api": "openai-completions",
+      "keys": [
+        { "key": "sk-cn-key-1", "label": "cn-1", "enabled": true },
+        { "key": "sk-cn-key-2", "label": "cn-2", "enabled": true }
+      ]
+    }
+  ]
+}
